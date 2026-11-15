@@ -1,0 +1,180 @@
+import os
+import ssl
+import time
+from urllib.parse import urlparse, unquote
+import pg8000.dbapi
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def get_conn():
+    raw_url = os.getenv("DATABASE_URL", "")
+    if not raw_url or "YAHAN_" in raw_url:
+        raise ValueError("DATABASE_URL .env file me set nahi hai!")
+    url = urlparse(raw_url)
+    for attempt in range(3):
+        try:
+            return pg8000.dbapi.connect(
+                user=unquote(url.username or ""),
+                password=unquote(url.password or ""),
+                host=url.hostname,
+                port=url.port or 5432,
+                database=url.path.lstrip("/"),
+                ssl_context=ssl.create_default_context()
+            )
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(1.5)
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS system_config (
+            id INT PRIMARY KEY DEFAULT 1,
+            trading_mode VARCHAR(20) DEFAULT 'PAPER_SIM',
+            active_capital NUMERIC(12, 2) DEFAULT 50000.00,
+            safe_vault_profit NUMERIC(12, 2) DEFAULT 0.00,
+            daily_max_loss_pct NUMERIC(5, 2) DEFAULT 2.00,
+            kill_switch BOOLEAN DEFAULT FALSE,
+            market_bias VARCHAR(30) DEFAULT 'NEUTRAL',
+            active_symbol VARCHAR(20) DEFAULT 'NIFTY',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS active_symbol VARCHAR(20) DEFAULT 'NIFTY'")
+    cur.execute("INSERT INTO system_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trades_journal (
+            id SERIAL PRIMARY KEY,
+            symbol VARCHAR(50) NOT NULL,
+            instrument VARCHAR(30) NOT NULL,
+            side VARCHAR(10) NOT NULL,
+            setup_reason VARCHAR(150) NOT NULL,
+            entry_price NUMERIC(10, 2) NOT NULL,
+            stop_loss NUMERIC(10, 2) NOT NULL,
+            target_price NUMERIC(10, 2) NOT NULL,
+            trailing_sl NUMERIC(10, 2) NOT NULL,
+            qty INT NOT NULL,
+            exit_price NUMERIC(10, 2),
+            pnl_net NUMERIC(10, 2) DEFAULT 0.00,
+            status VARCHAR(20) DEFAULT 'OPEN',
+            is_expiry_day BOOLEAN DEFAULT FALSE,
+            opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            closed_at TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_system_state():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT trading_mode, active_capital, safe_vault_profit,
+               daily_max_loss_pct, kill_switch, market_bias, active_symbol
+        FROM system_config WHERE id = 1
+    """)
+    row = cur.fetchone()
+    conn.close()
+    return {
+        "mode": row[0],
+        "active_capital": float(row[1]),
+        "safe_vault": float(row[2]),
+        "max_loss_pct": float(row[3]),
+        "kill_switch": bool(row[4]),
+        "market_bias": row[5],
+        "active_symbol": row[6] or "NIFTY"
+    }
+
+def update_setting(field: str, value):
+    if field not in ("kill_switch", "trading_mode", "active_symbol"):
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE system_config SET {field} = %s, updated_at = NOW() WHERE id = 1", (value,))
+    conn.commit()
+    conn.close()
+
+def get_today_pnl():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(SUM(pnl_net), 0)
+        FROM trades_journal
+        WHERE status = 'CLOSED' AND DATE(opened_at + INTERVAL '330 minutes') = DATE(NOW() + INTERVAL '330 minutes')
+    """)
+    val = float(cur.fetchone()[0])
+    conn.close()
+    return val
+
+def open_virtual_trade(symbol, instrument, side, reason, entry, sl, target, qty, is_expiry):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO trades_journal
+        (symbol, instrument, side, setup_reason, entry_price, stop_loss, target_price, trailing_sl, qty, is_expiry_day)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+    """, (symbol, instrument, side, reason, entry, sl, target, sl, qty, is_expiry))
+    trade_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return trade_id
+
+def get_open_trades():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, symbol, instrument, side, setup_reason, entry_price,
+               stop_loss, target_price, trailing_sl, qty, is_expiry_day
+        FROM trades_journal WHERE status = 'OPEN'
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def update_trailing_sl(trade_id, new_sl):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE trades_journal SET trailing_sl = %s WHERE id = %s", (new_sl, trade_id))
+    conn.commit()
+    conn.close()
+
+def close_virtual_trade(trade_id, exit_price, gross_pnl):
+    net_pnl = round(gross_pnl - 55.0, 2)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE trades_journal
+        SET exit_price = %s, pnl_net = %s, status = 'CLOSED', closed_at = NOW()
+        WHERE id = %s
+    """, (exit_price, net_pnl, trade_id))
+
+    if net_pnl > 0:
+        to_vault = round(net_pnl * 0.40, 2)
+        to_capital = round(net_pnl * 0.60, 2)
+        cur.execute("""
+            UPDATE system_config
+            SET safe_vault_profit = safe_vault_profit + %s,
+                active_capital = active_capital + %s
+            WHERE id = 1
+        """, (to_vault, to_capital))
+    else:
+        cur.execute("UPDATE system_config SET active_capital = active_capital + %s WHERE id = 1", (net_pnl,))
+
+    conn.commit()
+    conn.close()
+    return net_pnl
+
+def get_recent_trades(limit=15):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, symbol, side, setup_reason, entry_price, trailing_sl,
+               target_price, exit_price, pnl_net, status, opened_at
+        FROM trades_journal ORDER BY id DESC LIMIT %s
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
